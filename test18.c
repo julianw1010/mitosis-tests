@@ -2,6 +2,7 @@
 // Tests that threads can be created while replication is active
 // and that they can access memory correctly
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
