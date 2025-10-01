@@ -1,5 +1,4 @@
-// test_thread_fork_replication.c
-// Compile: gcc -o test_thread_fork test_thread_fork_replication.c -pthread -lnuma
+// Compile: gcc -o test34 test_thread_fork_replication.c -pthread -lnuma
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +18,7 @@
 #define NUM_THREADS 4
 #define ITERATIONS 1000
 
-// Test results tracking (only meaningful within same process)
+// Test results tracking
 typedef struct {
     atomic_int parent_threads_ok;
     atomic_int failures;
@@ -38,7 +37,6 @@ typedef struct {
 static void trigger_page_walks(int iterations) {
     volatile long sum = 0;
     for (int i = 0; i < iterations; i++) {
-        // Allocate and touch memory to trigger page faults
         char *mem = malloc(4096);
         if (mem) {
             mem[0] = i & 0xFF;
@@ -78,6 +76,10 @@ static void* thread_worker(void *arg) {
     thread_data_t *data = (thread_data_t*)arg;
     int node = data->target_node;
     
+    printf("[T%d] DEBUG: Thread started, data=%p, tid=%d, node=%d, phase=%d\n",
+           data->thread_id, data, data->thread_id, node, data->phase);
+    fflush(stdout);
+    
     // Pin to target node
     if (pin_to_node(node) < 0) {
         printf("[T%d Phase%d] FAIL: Cannot pin to node %d\n", 
@@ -106,7 +108,6 @@ static void* thread_worker(void *arg) {
         return NULL;
     }
     
-    // Should be enabled for parent threads
     if (repl_status == 0) {
         printf("[%s] FAIL: Replication unexpectedly disabled\n", context);
         atomic_fetch_add(&results.failures, 1);
@@ -118,9 +119,29 @@ static void* thread_worker(void *arg) {
     
     printf("[%s] PASS: Thread completed successfully (repl_mask=0x%x)\n", 
            context, repl_status);
+    fflush(stdout);
+    
+    // DEBUG: Check phase value before increment decision
+    int local_phase = data->phase;
+    printf("[T%d] DEBUG: About to check phase, local_phase=%d, data->phase=%d\n",
+           data->thread_id, local_phase, data->phase);
+    fflush(stdout);
     
     if (data->phase == 1) {
-        atomic_fetch_add(&results.parent_threads_ok, 1);
+        int before = atomic_load(&results.parent_threads_ok);
+        printf("[T%d] DEBUG: Phase==1, incrementing counter (before=%d)\n",
+               data->thread_id, before);
+        fflush(stdout);
+        
+        int after = atomic_fetch_add(&results.parent_threads_ok, 1) + 1;
+        
+        printf("[T%d] DEBUG: Counter incremented (after=%d)\n",
+               data->thread_id, after);
+        fflush(stdout);
+    } else {
+        printf("[T%d] DEBUG: Phase!=%d, NOT incrementing counter\n",
+               data->thread_id, data->phase);
+        fflush(stdout);
     }
     
     return NULL;
@@ -130,6 +151,7 @@ static void* thread_worker(void *arg) {
 static int test_child_process() {
     printf("\n=== CHILD PROCESS TEST ===\n");
     printf("[Child PID=%d] Started\n", getpid());
+    fflush(stdout);
     
     // 1. Verify replication is DISABLED in child
     int status = check_replication("Child-Initial");
@@ -158,6 +180,9 @@ static int test_child_process() {
     pthread_t thread;
     thread_data_t data = {.thread_id = 99, .target_node = 1, .phase = 2};
     
+    printf("[Child] DEBUG: Creating child thread, phase=%d\n", data.phase);
+    fflush(stdout);
+    
     if (pthread_create(&thread, NULL, thread_worker, &data) != 0) {
         printf("[Child] FAIL: Cannot create thread\n");
         return -1;
@@ -166,6 +191,7 @@ static int test_child_process() {
     pthread_join(thread, NULL);
     
     printf("[Child] PASS: All child tests completed\n");
+    fflush(stdout);
     
     return 0;
 }
@@ -179,6 +205,8 @@ int main() {
     printf("=== MITOSIS THREAD-FORK REPLICATION TEST ===\n");
     printf("PID: %d\n", getpid());
     printf("NUMA nodes available: %d\n", num_nodes);
+    printf("DEBUG: thread_data array at %p\n", thread_data);
+    fflush(stdout);
     
     if (num_nodes < 2) {
         printf("ERROR: Need at least 2 NUMA nodes\n");
@@ -208,6 +236,10 @@ int main() {
         thread_data[i].target_node = i % num_nodes;
         thread_data[i].phase = 0;
         
+        printf("DEBUG: Creating thread %d: data[%d]=%p, phase=%d\n",
+               i, i, &thread_data[i], thread_data[i].phase);
+        fflush(stdout);
+        
         if (pthread_create(&threads[i], NULL, thread_worker, &thread_data[i]) != 0) {
             printf("FAIL: Cannot create thread %d\n", i);
             return 1;
@@ -227,6 +259,7 @@ int main() {
     
     // PHASE 3: Fork while replication is active
     printf("\n=== PHASE 3: FORK TEST ===\n");
+    fflush(stdout);
     
     child_pid = fork();
     
@@ -244,6 +277,9 @@ int main() {
     // PARENT PROCESS
     printf("\n=== PHASE 4: PARENT POST-FORK TEST ===\n");
     printf("[Parent PID=%d] Continuing after fork\n", getpid());
+    printf("DEBUG: Counter before post-fork threads: %d\n", 
+           atomic_load(&results.parent_threads_ok));
+    fflush(stdout);
     
     // Verify parent replication still enabled
     status = check_replication("Parent-AfterFork");
@@ -253,11 +289,18 @@ int main() {
     }
     printf("[Parent] PASS: Replication still enabled (mask=0x%x)\n", status);
     
+    // CRITICAL: Zero out or reinitialize the array to avoid stale data
+    memset(thread_data, 0, sizeof(thread_data));
+    
     // Spawn new threads AFTER fork
     for (int i = 0; i < NUM_THREADS; i++) {
         thread_data[i].thread_id = i + 100;
         thread_data[i].target_node = i % num_nodes;
         thread_data[i].phase = 1;
+        
+        printf("DEBUG: Creating post-fork thread %d: data[%d]=%p, phase=%d\n",
+               i, i, &thread_data[i], thread_data[i].phase);
+        fflush(stdout);
         
         if (pthread_create(&threads[i], NULL, thread_worker, &thread_data[i]) != 0) {
             printf("[Parent] FAIL: Cannot create post-fork thread %d\n", i);
@@ -267,8 +310,14 @@ int main() {
     
     // Wait for post-fork threads
     for (int i = 0; i < NUM_THREADS; i++) {
+        printf("DEBUG: Joining post-fork thread %d\n", i);
+        fflush(stdout);
         pthread_join(threads[i], NULL);
     }
+    
+    printf("DEBUG: Counter after all post-fork threads: %d\n",
+           atomic_load(&results.parent_threads_ok));
+    fflush(stdout);
     
     // Wait for child
     int child_status;
@@ -280,7 +329,6 @@ int main() {
     printf("Parent post-fork threads OK: %d/%d\n", 
            atomic_load(&results.parent_threads_ok), NUM_THREADS);
     
-    // Check child via exit status (not shared memory)
     int child_ok = WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0;
     printf("Child test OK: %s (exit status: %d)\n", 
            child_ok ? "YES" : "NO",
